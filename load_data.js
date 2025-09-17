@@ -15,10 +15,18 @@ async function loadData() {
     console.log('✅ Connected to PostGIS');
 
     const rawData = fs.readFileSync('./data/sf_parking.geojson', 'utf8');
-    const data = JSON.parse(rawData);
+    let data;
 
-    if (!data.features || !Array.isArray(data.features)) {
-      throw new Error('GeoJSON format invalid: no features array found');
+    try {
+      data = JSON.parse(rawData);
+    } catch (parseErr) {
+      console.error('❌ Failed to parse GeoJSON:', parseErr.message);
+      process.exit(1);
+    }
+
+    if (!data || !data.features || !Array.isArray(data.features)) {
+      console.error('❌ Invalid GeoJSON structure: missing "features" array');
+      process.exit(1);
     }
 
     console.log(`📦 Found ${data.features.length} features`);
@@ -28,33 +36,49 @@ async function loadData() {
 
     for (let i = 0; i < data.features.length; i++) {
       const feature = data.features[i];
+
+      // Guard: must have properties and geometry
+      if (!feature || typeof feature !== 'object') {
+        console.warn(`⚠️ Skipping feature ${i}: invalid feature object`);
+        skipped++;
+        continue;
+      }
+
       const props = feature.properties || {};
       const geom = feature.geometry;
 
-      // 🛑 EARLY EXIT: Skip if geometry is missing or not LineString
+      // Guard: must have LineString geometry
       if (!geom || geom.type !== 'LineString') {
         skipped++;
         continue;
       }
 
-      // 🛑 EXTRA DEFENSE: Skip if coordinates is missing or not array
+      // Guard: coordinates must exist and be array
       if (!geom.coordinates || !Array.isArray(geom.coordinates)) {
-        console.warn(`⚠️ Feature ${i}: Invalid coordinates`, geom);
+        console.warn(`⚠️ Skipping feature ${i}: invalid or missing coordinates`);
+        skipped++;
+        continue;
+      }
+
+      let wkt;
+      try {
+        // ✅ DEFEND EACH COORDINATE
+        const coords = [];
+        for (let j = 0; j < geom.coordinates.length; j++) {
+          const c = geom.coordinates[j];
+          if (!Array.isArray(c) || c.length < 2 || typeof c[0] !== 'number' || typeof c[1] !== 'number') {
+            throw new Error(`Invalid coordinate at index ${j}: ${JSON.stringify(c)}`);
+          }
+          coords.push(`${c[0]} ${c[1]}`);
+        }
+        wkt = `LINESTRING(${coords.join(', ')})`;
+      } catch (coordErr) {
+        console.warn(`⚠️ Skipping feature ${i} due to bad coordinates:`, coordErr.message);
         skipped++;
         continue;
       }
 
       try {
-        // ✅ Now safe to map
-        const coords = geom.coordinates.map(c => {
-          if (!Array.isArray(c) || c.length < 2) {
-            throw new Error('Invalid coordinate pair');
-          }
-          return `${c[0]} ${c[1]}`;
-        }).join(', ');
-
-        const wkt = `LINESTRING(${coords})`;
-
         const query = `
           INSERT INTO parking_rules (
             block_id, street_name, from_address, to_address, side_of_street, direction,
@@ -64,6 +88,7 @@ async function loadData() {
           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, ST_GeomFromText($17, 4326))
         `;
 
+        // ✅ DEFEND AGAINST UNDEFINED FIELDS
         const values = [
           props.block_id || null,
           props.street_name || null,
@@ -74,7 +99,7 @@ async function loadData() {
           props.zone_color || null,
           props.restriction_type || null,
           props.time_range || null,
-          props.days_active ? String(props.days_active).split(',') : [],
+          props.days_active ? String(props.days_active).split(',').map(s => s.trim()) : [],
           props.meter_rate || null,
           props.meter_hours || null,
           props.time_limit || null,
@@ -86,18 +111,27 @@ async function loadData() {
 
         await client.query(query, values);
         inserted++;
+
+        // Progress indicator every 500 rows
+        if (inserted % 500 === 0) {
+          console.log(`↪️  Inserted ${inserted} rules so far...`);
+        }
+
       } catch (rowErr) {
-        console.warn(`⚠️ Skipping feature ${i} due to error:`, rowErr.message);
+        console.warn(`⚠️ Skipping feature ${i} due to DB error:`, rowErr.message);
         skipped++;
+        continue;
       }
     }
 
-    console.log(`✅ Inserted: ${inserted} rules`);
-    console.log(`⚠️ Skipped: ${skipped} features`);
+    console.log(`✅ INSERTED: ${inserted} parking rules`);
+    console.log(`⚠️ SKIPPED: ${skipped} features`);
     await client.end();
     console.log('🔌 Database connection closed');
+
   } catch (err) {
     console.error('❌ FATAL ERROR:', err.message);
+    await client.end().catch(() => {});
     process.exit(1);
   }
 }
