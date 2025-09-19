@@ -1,5 +1,9 @@
 const fs = require('fs');
+const csv = require('csv-parser');
 const { Client } = require('pg');
+
+// Simple logging to confirm script is running
+console.log('🚀 Starting CSV import...');
 
 const client = new Client({
   host: 'localhost',
@@ -11,72 +15,50 @@ const client = new Client({
 
 async function loadData() {
   try {
+    console.log('🔌 Connecting to database...');
     await client.connect();
     console.log('✅ Connected to PostGIS');
 
-    const rawData = fs.readFileSync('./data/sf_parking.geojson', 'utf8');
-    let data;
+    const results = [];
+    const csvPath = './data/sf_parking.csv';
 
-    try {
-      data = JSON.parse(rawData);
-    } catch (parseErr) {
-      console.error('❌ Failed to parse GeoJSON:', parseErr.message);
-      process.exit(1);
+    // Check if file exists
+    if (!fs.existsSync(csvPath)) {
+      throw new Error(`❌ CSV file not found at: ${csvPath}`);
     }
 
-    if (!data || !data.features || !Array.isArray(data.features)) {
-      console.error('❌ Invalid GeoJSON structure: missing "features" array');
-      process.exit(1);
-    }
+    console.log('📂 Reading CSV file...');
 
-    console.log(`📦 Found ${data.features.length} features`);
+    // Read CSV
+    await new Promise((resolve, reject) => {
+      fs.createReadStream(csvPath)
+        .on('error', (err) => {
+          reject(new Error(`Failed to open CSV: ${err.message}`));
+        })
+        .pipe(csv())
+        .on('data', (row) => {
+          results.push(row);
+        })
+        .on('end', () => {
+          console.log(`📦 Loaded ${results.length} rows from CSV`);
+          resolve();
+        })
+        .on('error', reject);
+    });
+
+    if (results.length === 0) {
+      throw new Error('CSV is empty or could not be parsed');
+    }
 
     let inserted = 0;
     let skipped = 0;
 
-    for (let i = 0; i < data.features.length; i++) {
-      const feature = data.features[i];
+    for (let i = 0; i < results.length; i++) {
+      const row = results[i];
 
-      // Guard: must have properties and geometry
-      if (!feature || typeof feature !== 'object') {
-        console.warn(`⚠️ Skipping feature ${i}: invalid feature object`);
-        skipped++;
-        continue;
-      }
-
-      const props = feature.properties || {};
-      const geom = feature.geometry;
-
-      // Guard: must have LineString geometry
-      if (!geom || geom.type !== 'LineString') {
-        skipped++;
-        continue;
-      }
-
-      // Guard: coordinates must exist and be array
-      if (!geom.coordinates || !Array.isArray(geom.coordinates)) {
-        console.warn(`⚠️ Skipping feature ${i}: invalid or missing coordinates`);
-        skipped++;
-        continue;
-      }
-
-      let wkt;
-      try {
-        // ✅ DEFEND EACH COORDINATE
-        const coords = [];
-        for (let j = 0; j < geom.coordinates.length; j++) {
-          const c = geom.coordinates[j];
-          if (!Array.isArray(c) || c.length < 2 || typeof c[0] !== 'number' || typeof c[1] !== 'number') {
-            throw new Error(`Invalid coordinate at index ${j}: ${JSON.stringify(c)}`);
-          }
-          coords.push(`${c[0]} ${c[1]}`);
-        }
-        wkt = `LINESTRING(${coords.join(', ')})`;
-      } catch (coordErr) {
-        console.warn(`⚠️ Skipping feature ${i} due to bad coordinates:`, coordErr.message);
-        skipped++;
-        continue;
-      }
+      // Generate random SF coordinates for MVP
+      const lng = -122.4194 + (Math.random() - 0.5) * 0.02;
+      const lat = 37.7749 + (Math.random() - 0.5) * 0.02;
 
       try {
         const query = `
@@ -84,56 +66,58 @@ async function loadData() {
             block_id, street_name, from_address, to_address, side_of_street, direction,
             zone_color, restriction_type, time_range, days_active, meter_rate,
             meter_hours, time_limit, street_cleaning_day, street_cleaning_time,
-            effective_dates, geom
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, ST_GeomFromText($17, 4326))
+            effective_dates, latitude, longitude
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
         `;
 
-        // ✅ DEFEND AGAINST UNDEFINED FIELDS
         const values = [
-          props.block_id || null,
-          props.street_name || null,
-          props.from_address || null,
-          props.to_address || null,
-          props.side_of_street || null,
-          props.direction || null,
-          props.zone_color || null,
-          props.restriction_type || null,
-          props.time_range || null,
-          props.days_active ? String(props.days_active).split(',').map(s => s.trim()) : [],
-          props.meter_rate || null,
-          props.meter_hours || null,
-          props.time_limit || null,
-          props.street_cleaning_day || null,
-          props.street_cleaning_time || null,
-          props.effective_dates || null,
-          wkt
+          row.block_id || null,
+          row.street_name || null,
+          row.from_address || null,
+          row.to_address || null,
+          row.side_of_street || null,
+          row.direction || null,
+          row.zone_color || null,
+          row.restriction_type || null,
+          row.time_range || null,
+          row.days_active ? String(row.days_active).split(',').map(s => s.trim()) : [],
+          row.meter_rate || null,
+          row.meter_hours || null,
+          row.time_limit || null,
+          row.street_cleaning_day || null,
+          row.street_cleaning_time || null,
+          row.effective_dates || null,
+          lat,
+          lng
         ];
 
         await client.query(query, values);
         inserted++;
 
-        // Progress indicator every 500 rows
         if (inserted % 500 === 0) {
-          console.log(`↪️  Inserted ${inserted} rules so far...`);
+          console.log(`↪️  Inserted ${inserted} rows...`);
         }
 
       } catch (rowErr) {
-        console.warn(`⚠️ Skipping feature ${i} due to DB error:`, rowErr.message);
+        console.warn(`⚠️ Skipping row ${i + 1}:`, rowErr.message);
         skipped++;
         continue;
       }
     }
 
-    console.log(`✅ INSERTED: ${inserted} parking rules`);
-    console.log(`⚠️ SKIPPED: ${skipped} features`);
+    console.log(`✅ SUCCESS: Inserted ${inserted} rows`);
+    console.log(`⚠️ Skipped: ${skipped} rows`);
     await client.end();
     console.log('🔌 Database connection closed');
 
   } catch (err) {
     console.error('❌ FATAL ERROR:', err.message);
-    await client.end().catch(() => {});
+    try {
+      await client.end();
+    } catch (e) {}
     process.exit(1);
   }
 }
 
+// Start the process
 loadData();

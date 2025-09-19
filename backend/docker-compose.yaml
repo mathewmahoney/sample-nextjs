@@ -1,3 +1,5 @@
+# backend/docker-compose.yml
+version: '3.8'
 
 services:
   db:
@@ -9,13 +11,19 @@ services:
       POSTGRES_USER: pguser
       POSTGRES_PASSWORD: pgpass
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - pg_/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pguser -d parkguard"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   adminer:
     image: adminer
     ports:
       - "8080:8080"
+    depends_on:
+      - db
 
 volumes:
-  pg_data:
-  
+  pg_
